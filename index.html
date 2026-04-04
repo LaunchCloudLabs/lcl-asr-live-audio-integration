@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LCL SOVEREIGN V13 - INDUSTRIAL COMMAND</title>
+    <style>
+        body { font-family: 'Inter', -apple-system, sans-serif; background: #000; color: #00ff41; padding: 2rem; }
+        .console { max-width: 1100px; margin: 0 auto; border: 2px solid #333; border-radius: 10px; padding: 20px; background: #050505; }
+        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #333; padding-bottom: 15px; }
+        .status-light { width: 12px; height: 12px; border-radius: 50%; background: #222; margin-right: 10px; display: inline-block;}
+        .active { background: #00ff41; box-shadow: 0 0 10px #00ff41; }
+        .reconnecting { background: #ff8c00; box-shadow: 0 0 10px #ff8c00; animation: pulse 1s infinite; }
+        @keyframes pulse { 50% { opacity: 0.4; } }
+
+        .main-grid { display: grid; grid-template-columns: 350px 1fr; gap: 20px; margin-top: 20px; }
+        .box { border: 1px solid #222; padding: 20px; border-radius: 5px; background: #0a0a0a; }
+
+        button { background: #000; color: #00ff41; border: 1px solid #00ff41; padding: 15px; width: 100%; cursor: pointer; text-transform: uppercase; font-weight: bold; margin-bottom: 10px; }
+        button:hover { background: #00ff41; color: #000; }
+
+        #transcript { height: 400px; overflow-y: auto; background: #000; border: 1px solid #111; padding: 15px; font-family: 'SF Mono', monospace; line-height: 1.6; }
+        .seg { margin-bottom: 10px; border-left: 2px solid #00ff41; padding-left: 10px; animation: fadein 0.3s; }
+        .seg.sys { color: #555; border-left-color: #333; }
+        .seg.err { color: #ff4444; border-left-color: #ff4444; }
+        @keyframes fadein { from { opacity: 0; transform: translateX(-5px); } to { opacity: 1; transform: translateX(0); } }
+
+        #vu-meter { width: 100%; height: 50px; background: #111; border: 1px solid #222; position: relative; overflow: hidden; }
+        #vu-bar { height: 100%; background: #00ff41; width: 0%; transition: width 0.08s linear; }
+        #stats { margin-top: 15px; font-size: 0.7rem; color: #555; font-family: 'SF Mono', monospace; }
+    </style>
+</head>
+<body>
+    <div class="console">
+        <div class="header">
+            <div style="font-size: 1.5rem; font-weight: 900; letter-spacing: 5px;">SOVEREIGN V13</div>
+            <div><span id="led" class="status-light"></span> HUB: <span id="status">OFFLINE</span></div>
+        </div>
+
+        <div class="main-grid">
+            <div class="box">
+                <button id="init-btn" onclick="startAudio()">START AUDIO ENGINE</button>
+                <div id="vu-meter"><div id="vu-bar"></div></div>
+                <div id="stats">AUDIO: 16KHZ PCM | PACKETS: 0</div>
+            </div>
+
+            <div class="box">
+                <div style="margin-bottom: 10px; font-size: 0.8rem; color: #888;">ASR: WHISPER-TINY | GAIN: 15x</div>
+                <div id="transcript"><div class="seg sys">Waiting for hub sync...</div></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let audioCtx, gainNode, isLive = false, socket = null;
+        let nextPlayTime = 0, packetCount = 0, reconnectDelay = 1000;
+        const transcript = document.getElementById('transcript');
+        const statusEl = document.getElementById('status');
+        const led = document.getElementById('led');
+        const vu = document.getElementById('vu-bar');
+        const stats = document.getElementById('stats');
+
+        function log(text, cls = 'seg', rawHtml = false) {
+            const div = document.createElement('div');
+            div.className = cls;
+            if (rawHtml) div.innerHTML = text;
+            else div.innerText = text;
+            transcript.appendChild(div);
+            transcript.scrollTop = transcript.scrollHeight;
+        }
+
+        function getWsUrl() {
+            return 'ws://launchcloud.duckdns.org:8765';
+        }
+
+        function connect() {
+            if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+
+            const wsUrl = getWsUrl();
+            statusEl.innerText = 'CONNECTING...';
+            led.className = 'status-light reconnecting';
+            log('Connecting to ' + wsUrl + '...', 'seg sys');
+
+            socket = new WebSocket(wsUrl);
+            socket.binaryType = 'arraybuffer';
+
+            socket.onopen = () => {
+                statusEl.innerText = 'ONLINE';
+                led.className = 'status-light active';
+                reconnectDelay = 1000;
+                socket.send(JSON.stringify({type: 'register_web'}));
+                log('Hub synced. Speak.', 'seg sys');
+            };
+
+            socket.onmessage = (e) => {
+                if (e.data instanceof ArrayBuffer) {
+                    packetCount++;
+                    const int16 = new Int16Array(e.data);
+                    let maxVal = 0;
+                    for (let i = 0; i < int16.length; i++) {
+                        const v = Math.abs(int16[i]) / 32768.0;
+                        if (v > maxVal) maxVal = v;
+                    }
+                    vu.style.width = Math.min(maxVal * 300, 100) + '%';
+                    stats.innerText = 'AUDIO: 16KHZ PCM | PACKETS: ' + packetCount + ' | PEAK: ' + (maxVal * 100).toFixed(1) + '%';
+
+                    if (!isLive || !audioCtx) return;
+
+                    // Resume context if suspended (browser policy enforcement)
+                    if (audioCtx.state === 'suspended') {
+                        audioCtx.resume();
+                        return;
+                    }
+
+                    const float32 = new Float32Array(int16.length);
+                    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+
+                    const buffer = audioCtx.createBuffer(1, float32.length, 16000);
+                    buffer.getChannelData(0).set(float32);
+                    const src = audioCtx.createBufferSource();
+                    src.buffer = buffer;
+                    src.connect(gainNode);
+
+                    const now = audioCtx.currentTime;
+                    // Cap lookahead to 0.3s to avoid massive scheduling drift
+                    if (nextPlayTime < now || nextPlayTime > now + 0.3) nextPlayTime = now + 0.05;
+                    src.start(nextPlayTime);
+                    if (packetCount % 20 === 0) console.log('[AUDIO] ctx=' + audioCtx.state + ' peak=' + (maxVal*100).toFixed(2) + '% npt=' + nextPlayTime.toFixed(2));
+                    nextPlayTime += buffer.duration;
+                } else {
+                    try {
+                        const data = JSON.parse(e.data);
+                        if (data.type === 'transcript') {
+                            const speaker = data.speaker || 'Speaker 1';
+                            const color   = data.color   || '#00ff41';
+                            const line    = `<span style="color:${color};font-weight:bold">[${speaker}]</span> ${data.text}`;
+                            log(line, 'seg transcript', true);
+                        }
+                    } catch (err) { /* ignore non-JSON */ }
+                }
+            };
+
+            socket.onclose = () => {
+                statusEl.innerText = 'DISCONNECTED';
+                led.className = 'status-light';
+                log('Hub disconnected. Reconnecting in ' + (reconnectDelay/1000) + 's...', 'seg err');
+                setTimeout(connect, reconnectDelay);
+                reconnectDelay = Math.min(reconnectDelay * 1.5, 10000);
+            };
+
+            socket.onerror = () => {
+                log('WebSocket error', 'seg err');
+            };
+        }
+
+        async function startAudio() {
+            if (isLive) return;
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            gainNode = audioCtx.createGain();
+            gainNode.gain.value = 10.0;  // server already applies 15x; 10x here = 150x total
+            gainNode.connect(audioCtx.destination);
+            nextPlayTime = 0;
+            isLive = true;
+            // Must call resume() in the user-gesture handler
+            try {
+                await audioCtx.resume();
+            } catch(e) { console.warn('[AUDIO] resume failed:', e); }
+            console.log('[AUDIO] Context state:', audioCtx.state);
+            document.getElementById('init-btn').innerText = 'AUDIO ENGINE READY (ctx=' + audioCtx.state + ')';
+        }
+
+        connect();
+    </script>
+</body>
+</html>

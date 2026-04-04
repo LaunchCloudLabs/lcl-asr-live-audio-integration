@@ -1,0 +1,7 @@
+*.wav
+*.pyc
+__pycache__/
+.DS_Store
+*.log
+hub_stream.wav
+temp_chunk.wav
