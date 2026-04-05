@@ -48,10 +48,11 @@ switch ($event_type) {
         break;
 
     case 'call.answered':
-        // Start media streaming to the WSS hub
+        // Start media streaming to the WSS hub — force PCMU so hub's µ-law encoding matches
         telnyx_post("/calls/" . $call_control_id . "/actions/streaming_start", array(
             'stream_url'   => STREAM_URL,
             'stream_track' => 'both_tracks',
+            'codec'        => 'PCMU',
         ));
         break;
 

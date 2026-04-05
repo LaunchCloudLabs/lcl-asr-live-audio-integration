@@ -182,12 +182,23 @@ async def handler(websocket):
         async for message in websocket:
             try:
                 data = json.loads(message)
-                if data.get("event") == "start":
-                    sid = data["start"]["stream_id"]
+                evt = data.get("event", "")
+                print(f"[PHONE] Event: {evt} | keys: {list(data.keys())}")
+                if evt == "connected":
+                    print(f"[PHONE] Protocol connected: {data.get('version','?')}")
+                    continue
+                if evt == "start":
+                    # Telnyx may use stream_id or stream_sid — try both
+                    start_block = data.get("start", data)
+                    sid = (start_block.get("stream_id")
+                           or start_block.get("stream_sid")
+                           or data.get("stream_id")
+                           or "telnyx-stream")
+                    print(f"[PHONE] Stream start: sid={sid} block={start_block}")
                     await telnyx_bridge_handler(websocket, sid)
                     break
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[PHONE ERR] {e} | raw={message[:200]}")
         return
 
     print(f"[CONN] {addr}")
@@ -237,8 +248,9 @@ async def handler(websocket):
                                 "stream_id": sid,
                                 "media":     {"payload": payload}
                             }))
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            print(f"[PHONE SEND ERR] {e}")
+                            phone_streams.discard((p_ws, sid))
 
                 if pkt_count % 100 == 0:
                     print(f"[AUDIO] pkts={pkt_count} B={len(browsers)} P={len(phone_streams)} q={audio_queue.qsize()}")
