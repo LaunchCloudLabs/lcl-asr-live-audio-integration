@@ -32,6 +32,10 @@ browsers      = set()
 edge_nodes    = set()
 phone_streams = set()
 
+# Phone bridge audio state
+phone_ratecv_state = None   # audioop.ratecv state — persisted across packets
+phone_pcmu_buf     = b""    # accumulator — send when >= 160 bytes (20ms at 8kHz)
+
 # Deepgram feeder task
 audio_queue: asyncio.Queue = None   # initialized in main()
 
@@ -237,22 +241,28 @@ async def handler(websocket):
                 await audio_queue.put(msg)
 
 # Telnyx phone bridge (G.711 PCMU transcode)
-                # Telnyx expects: {"event":"media","media":"<base64>","stream_id":"<id>"}
-                # "media" is a plain string, NOT {"payload":"..."} like Twilio
+                # Per Telnyx docs: outgoing format is {"event":"media","media":{"payload":"base64"}}
+                # Minimum chunk size is 20ms = 160 bytes at 8kHz PCMU
+                # ratecv state is persisted across packets to avoid audio corruption
                 if phone_streams:
-                    pcm_8k  = audioop.ratecv(msg, 2, 1, 16000, 8000, None)[0]
-                    ulaw    = audioop.lin2ulaw(pcm_8k, 2)
-                    payload = base64.b64encode(ulaw).decode("utf-8")
-                    for p_ws, sid in list(phone_streams):
-                        try:
-                            await p_ws.send(json.dumps({
-                                "event":     "media",
-                                "stream_id": sid,
-                                "media":     payload,
-                            }))
-                        except Exception as e:
-                            print(f"[PHONE SEND ERR] {e}")
-                            phone_streams.discard((p_ws, sid))
+                    global phone_ratecv_state, phone_pcmu_buf
+                    pcm_8k, phone_ratecv_state = audioop.ratecv(
+                        msg, 2, 1, 16000, 8000, phone_ratecv_state)
+                    phone_pcmu_buf += audioop.lin2ulaw(pcm_8k, 2)
+                    # Send in 160-byte (20ms) chunks as required by Telnyx
+                    while len(phone_pcmu_buf) >= 160:
+                        chunk = phone_pcmu_buf[:160]
+                        phone_pcmu_buf = phone_pcmu_buf[160:]
+                        payload = base64.b64encode(chunk).decode("utf-8")
+                        for p_ws, sid in list(phone_streams):
+                            try:
+                                await p_ws.send(json.dumps({
+                                    "event": "media",
+                                    "media": {"payload": payload},
+                                }))
+                            except Exception as e:
+                                print(f"[PHONE SEND ERR] {e}")
+                                phone_streams.discard((p_ws, sid))
 
                 if pkt_count % 100 == 0:
                     print(f"[AUDIO] pkts={pkt_count} B={len(browsers)} P={len(phone_streams)} q={audio_queue.qsize()}")
