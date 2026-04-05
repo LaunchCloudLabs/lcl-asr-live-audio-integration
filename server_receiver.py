@@ -165,10 +165,16 @@ async def telnyx_bridge_handler(websocket, stream_id):
 
 # ── Main WebSocket handler ─────────────────────────────────────────────────────
 
-async def handler(websocket, path="/"):
+async def handler(websocket):
     global audio_queue
     addr = websocket.remote_address
     pkt_count = 0
+
+    # websockets v15: path is on websocket.request.path, not passed as argument
+    try:
+        path = websocket.request.path
+    except Exception:
+        path = "/"
 
     # Route Telnyx connections
     if path == "/telnyx":
@@ -270,19 +276,26 @@ async def handler(websocket, path="/"):
 async def main():
     global audio_queue
     audio_queue = asyncio.Queue(maxsize=500)  # ~500 ESP32 packets buffer
-    print("--- LCL SOVEREIGN HUB V15 (DEEPGRAM NOVA-3) ONLINE ---")
+    print("--- LCL SOVEREIGN HUB V16 (DEEPGRAM NOVA-3) ONLINE ---")
     asyncio.create_task(deepgram_engine())
 
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
 
+    # Port 8765 — WSS (TLS) for browsers + Telnyx (HTTPS pages require wss://)
+    # Port 8766 — plain WS for ESP32 (microcontroller can't do TLS on-device)
     async with websockets.serve(
         handler, "0.0.0.0", 8765,
         ssl=ssl_ctx,
         ping_interval=None, ping_timeout=None,
         close_timeout=10, max_size=2**20, compression=None,
+    ), websockets.serve(
+        handler, "0.0.0.0", 8766,
+        ssl=None,
+        ping_interval=None, ping_timeout=None,
+        close_timeout=10, max_size=2**20, compression=None,
     ):
-        print("Listening on wss://0.0.0.0:8765 | TLS=ON | Telnyx bridge=READY | Nova-3=ACTIVE")
+        print("Listening on wss://0.0.0.0:8765 (browsers/Telnyx) | ws://0.0.0.0:8766 (ESP32)")
         await asyncio.Future()
 
 if __name__ == "__main__":
