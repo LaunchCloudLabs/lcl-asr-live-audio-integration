@@ -11,7 +11,7 @@
 const char* ssid     = "Verizon_SD4YSF";
 const char* password = "ply6glee9ran";
 const char* ws_host  = "192.168.1.160";
-const int   ws_port  = 8765;
+const int   ws_port  = 8766;   // plain WS (no TLS) — server WSS is 8765 for browsers only
 
 #define LED_PIN     2
 #define BUF_SAMPLES 512
