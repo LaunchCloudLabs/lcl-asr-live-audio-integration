@@ -3,6 +3,7 @@ import websockets
 import os
 import json
 import sys
+import ssl
 import audioop
 import base64
 import numpy as np
@@ -15,6 +16,10 @@ from collections import Counter
 DEEPGRAM_API_KEY = "ea603f87124d18a21411f19c20368e27abdc696e"
 GAIN_BOOST       = 15.0
 SAMPLE_RATE      = 16000
+
+CERT_DIR  = os.path.expanduser("~/certbot-duckdns/config/live/launchcloud.duckdns.org")
+CERT_FILE = os.path.join(CERT_DIR, "fullchain.pem")
+KEY_FILE  = os.path.join(CERT_DIR, "privkey.pem")
 
 SPEAKER_COLORS = [
     "#38bdf8", "#f59e0b", "#a855f7", "#10b981",
@@ -257,12 +262,17 @@ async def main():
     audio_queue = asyncio.Queue(maxsize=500)  # ~500 ESP32 packets buffer
     print("--- LCL SOVEREIGN HUB V15 (DEEPGRAM NOVA-3) ONLINE ---")
     asyncio.create_task(deepgram_engine())
+
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
+
     async with websockets.serve(
         handler, "0.0.0.0", 8765,
+        ssl=ssl_ctx,
         ping_interval=None, ping_timeout=None,
         close_timeout=10, max_size=2**20, compression=None,
     ):
-        print("Listening on 0.0.0.0:8765 | Telnyx bridge=READY | Nova-3=ACTIVE")
+        print("Listening on wss://0.0.0.0:8765 | TLS=ON | Telnyx bridge=READY | Nova-3=ACTIVE")
         await asyncio.Future()
 
 if __name__ == "__main__":
