@@ -5,3 +5,4 @@ __pycache__/
 *.log
 hub_stream.wav
 temp_chunk.wav
+telnyx/api.php

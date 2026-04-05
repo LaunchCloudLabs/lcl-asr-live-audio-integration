@@ -1,0 +1,71 @@
+<?php
+/**
+ * LCL Sovereign Voice Bridge — Telnyx Call Control Webhook
+ * Answers inbound calls and starts media streaming to the WSS hub.
+ */
+
+define('TELNYX_API_KEY', 'TELNYX_API_KEY_HERE');
+define('STREAM_URL',     'wss://launchcloud.duckdns.org:8765/telnyx');
+
+header('Content-Type: application/json');
+
+$body    = file_get_contents('php://input');
+$payload = json_decode($body, true);
+
+$event_type      = isset($payload['data']['event_type'])                  ? $payload['data']['event_type']                  : '';
+$call_control_id = isset($payload['data']['payload']['call_control_id'])  ? $payload['data']['payload']['call_control_id']  : '';
+$from            = isset($payload['data']['payload']['from'])             ? $payload['data']['payload']['from']             : '';
+$direction       = isset($payload['data']['payload']['direction'])        ? $payload['data']['payload']['direction']        : '';
+
+error_log("[LCL-BRIDGE] event=" . $event_type . " from=" . $from . " dir=" . $direction);
+
+function telnyx_post($path, $data) {
+    $ch = curl_init('https://api.telnyx.com/v2' . $path);
+    curl_setopt_array($ch, array(
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => json_encode($data),
+        CURLOPT_HTTPHEADER     => array(
+            'Authorization: Bearer ' . TELNYX_API_KEY,
+            'Content-Type: application/json',
+        ),
+        CURLOPT_TIMEOUT => 10,
+    ));
+    $resp = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    error_log("[LCL-BRIDGE] POST " . $path . " -> HTTP " . $code);
+    return array('code' => $code, 'body' => json_decode($resp, true));
+}
+
+switch ($event_type) {
+
+    case 'call.initiated':
+        // Answer every inbound call
+        if ($direction === 'incoming') {
+            telnyx_post("/calls/" . $call_control_id . "/actions/answer", array());
+        }
+        break;
+
+    case 'call.answered':
+        // Start media streaming to the WSS hub
+        telnyx_post("/calls/" . $call_control_id . "/actions/streaming_start", array(
+            'stream_url'   => STREAM_URL,
+            'stream_track' => 'both_tracks',
+        ));
+        break;
+
+    case 'call.streaming.started':
+        error_log("[LCL-BRIDGE] Media stream ACTIVE - audio flowing to hub");
+        break;
+
+    case 'call.hangup':
+    case 'call.streaming.stopped':
+        error_log("[LCL-BRIDGE] Call or stream ended");
+        break;
+
+    default:
+        break;
+}
+
+echo json_encode(array('received' => true, 'event' => $event_type));
