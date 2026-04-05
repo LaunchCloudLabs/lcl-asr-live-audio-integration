@@ -48,11 +48,12 @@ switch ($event_type) {
         break;
 
     case 'call.answered':
-        // Start media streaming to the WSS hub — force PCMU so hub's µ-law encoding matches
+        // Start media streaming — PCMU codec, bidirectional RTP so hub can inject audio to caller
         telnyx_post("/calls/" . $call_control_id . "/actions/streaming_start", array(
-            'stream_url'   => STREAM_URL,
-            'stream_track' => 'both_tracks',
-            'codec'        => 'PCMU',
+            'stream_url'                 => STREAM_URL,
+            'stream_track'               => 'both_tracks',
+            'stream_codec'               => 'PCMU',
+            'stream_bidirectional_mode'  => 'rtp',
         ));
         break;
 

@@ -237,6 +237,8 @@ async def handler(websocket):
                 await audio_queue.put(msg)
 
 # Telnyx phone bridge (G.711 PCMU transcode)
+                # Telnyx expects: {"event":"media","media":"<base64>","stream_id":"<id>"}
+                # "media" is a plain string, NOT {"payload":"..."} like Twilio
                 if phone_streams:
                     pcm_8k  = audioop.ratecv(msg, 2, 1, 16000, 8000, None)[0]
                     ulaw    = audioop.lin2ulaw(pcm_8k, 2)
@@ -246,7 +248,7 @@ async def handler(websocket):
                             await p_ws.send(json.dumps({
                                 "event":     "media",
                                 "stream_id": sid,
-                                "media":     {"payload": payload}
+                                "media":     payload,
                             }))
                         except Exception as e:
                             print(f"[PHONE SEND ERR] {e}")
