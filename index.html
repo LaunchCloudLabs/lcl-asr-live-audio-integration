@@ -221,7 +221,100 @@
         }
         @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
-        /* ── TRANSCRIPT HEADER ────────────────────── */
+        /* ── PHONE BRIDGE PANEL ──────────────────── */
+        .bridge-row {
+            display: flex;
+            flex-direction: column;
+            gap: 0.6rem;
+        }
+        .bridge-field label {
+            display: block;
+            font-size: 0.62rem;
+            font-weight: 700;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+            color: var(--lcl-muted);
+            margin-bottom: 4px;
+        }
+        .bridge-field input[type="text"] {
+            width: 100%;
+            background: var(--lcl-navy);
+            border: 1px solid var(--lcl-border);
+            border-radius: 6px;
+            padding: 8px 10px;
+            color: var(--lcl-white);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .bridge-field input[type="text"]:focus {
+            border-color: var(--lcl-electric);
+        }
+        .bridge-field input[type="text"][readonly] {
+            color: var(--lcl-muted);
+            cursor: default;
+        }
+        .toggle-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 6px 0;
+        }
+        .toggle-label {
+            font-size: 0.72rem;
+            font-weight: 600;
+            color: var(--lcl-text);
+        }
+        .toggle {
+            position: relative;
+            width: 38px; height: 20px;
+        }
+        .toggle input { display: none; }
+        .toggle-slider {
+            position: absolute; inset: 0;
+            background: var(--lcl-border);
+            border-radius: 20px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .toggle-slider::before {
+            content: '';
+            position: absolute;
+            width: 14px; height: 14px;
+            left: 3px; top: 3px;
+            background: white;
+            border-radius: 50%;
+            transition: transform 0.2s;
+        }
+        .toggle input:checked + .toggle-slider { background: var(--lcl-green); }
+        .toggle input:checked + .toggle-slider::before { transform: translateX(18px); }
+
+        button.save-btn {
+            width: 100%;
+            padding: 10px;
+            background: linear-gradient(135deg, var(--lcl-green), #059669);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-family: 'Inter', sans-serif;
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            cursor: pointer;
+            transition: opacity 0.2s;
+            margin-top: 0.4rem;
+        }
+        button.save-btn:hover { opacity: 0.88; }
+        #bridge-status {
+            font-size: 0.65rem;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--lcl-muted);
+            min-height: 16px;
+            margin-top: 4px;
+            text-align: center;
+        }
         .transcript-header {
             display: flex;
             align-items: center;
@@ -260,6 +353,7 @@
     <!-- MAIN GRID -->
     <div class="console">
         <!-- LEFT: controls -->
+        <div style="display:flex;flex-direction:column;gap:1rem;">
         <div class="panel">
             <div class="panel-title">Audio Engine</div>
             <button id="init-btn" onclick="startAudio()">▶ &nbsp;Activate Audio</button>
@@ -271,11 +365,36 @@
             <div id="stats">AUDIO: 16KHZ PCM<br>PACKETS: 0<br>PEAK: —</div>
         </div>
 
+        <!-- Phone Bridge Config Panel -->
+        <div class="panel">
+            <div class="panel-title">Phone Bridge</div>
+            <div class="bridge-row">
+                <div class="bridge-field">
+                    <label>Telnyx Number</label>
+                    <input type="text" id="telnyx-num" readonly value="+13212189801">
+                </div>
+                <div class="bridge-field">
+                    <label>Authorized Caller (Boss)</label>
+                    <input type="text" id="boss-num" placeholder="+1XXXXXXXXXX" value="+16037777815">
+                </div>
+                <div class="toggle-row">
+                    <span class="toggle-label">Bridge Active</span>
+                    <label class="toggle">
+                        <input type="checkbox" id="bridge-active" checked>
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <button class="save-btn" onclick="saveConfig()">💾 &nbsp;Save Config</button>
+                <div id="bridge-status"></div>
+            </div>
+        </div>
+        </div>
+
         <!-- RIGHT: transcript -->
         <div class="panel">
             <div class="transcript-header">
                 <div class="panel-title" style="margin-bottom:0;border:none;padding:0">Live Transcript</div>
-                <span class="badge">Whisper · Diarization ON</span>
+                <span class="badge">Nova-3 · Diarization ON</span>
             </div>
             <div id="transcript"><div class="seg sys">Waiting for hub sync...</div></div>
         </div>
@@ -365,6 +484,15 @@
                             const color   = data.color   || '#00ff41';
                             const line    = `<span style="color:${color};font-weight:bold">[${speaker}]</span> ${data.text}`;
                             log(line, 'seg transcript', true);
+                        } else if (data.type === 'config_status') {
+                            const el = document.getElementById('bridge-status');
+                            if (data.ok) {
+                                el.style.color = 'var(--lcl-green)';
+                                el.innerText = '✓ Config saved';
+                            } else {
+                                el.style.color = 'var(--lcl-red)';
+                                el.innerText = '✗ Save failed';
+                            }
                         }
                     } catch (err) { /* ignore non-JSON */ }
                 }
@@ -381,6 +509,22 @@
             socket.onerror = () => {
                 log('WebSocket error', 'seg err');
             };
+        }
+
+        function saveConfig() {
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                document.getElementById('bridge-status').style.color = 'var(--lcl-red)';
+                document.getElementById('bridge-status').innerText = '✗ Not connected to hub';
+                return;
+            }
+            const cfg = {
+                authorized_number: document.getElementById('boss-num').value.trim(),
+                telnyx_number:     document.getElementById('telnyx-num').value.trim(),
+                bridge_active:     document.getElementById('bridge-active').checked
+            };
+            socket.send(JSON.stringify({ type: 'update_config', config: cfg }));
+            document.getElementById('bridge-status').style.color = 'var(--lcl-muted)';
+            document.getElementById('bridge-status').innerText = 'Saving...';
         }
 
         async function startAudio() {
