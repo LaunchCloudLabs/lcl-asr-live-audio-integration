@@ -94,8 +94,18 @@ async def deepgram_engine():
                 print("[DG] Nova-3 ACTIVE")
 
                 async def feeder():
+                    """Feed audio to Deepgram; send KeepAlive every 8s when idle."""
+                    KEEPALIVE = json.dumps({"type": "KeepAlive"})
                     while True:
-                        chunk = await audio_queue.get()
+                        try:
+                            chunk = await asyncio.wait_for(audio_queue.get(), timeout=8.0)
+                        except asyncio.TimeoutError:
+                            # No audio — send keepalive to prevent Deepgram timeout
+                            try:
+                                await dg_ws.send(KEEPALIVE)
+                            except Exception:
+                                break
+                            continue
                         if chunk is None:   # sentinel — restart connection
                             break
                         try:
