@@ -6,3 +6,7 @@ __pycache__/
 hub_stream.wav
 temp_chunk.wav
 telnyx/api.php
+
+.lcl_keys
+.env
+*.env

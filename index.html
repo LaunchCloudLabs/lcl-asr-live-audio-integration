@@ -332,6 +332,67 @@
             color: var(--lcl-accent);
             border: 1px solid rgba(99,102,241,0.25);
         }
+        /* ── AI CHAT MODE PANEL ──────────────────────────── */
+        .model-btns {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.4rem;
+            margin-top: 0.4rem;
+        }
+        .model-btn {
+            padding: 5px 10px;
+            font-family: 'Inter', sans-serif;
+            font-size: 0.65rem;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            border: 1px solid var(--lcl-border);
+            border-radius: 6px;
+            background: var(--lcl-navy);
+            color: var(--lcl-muted);
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .model-btn:hover {
+            border-color: var(--lcl-electric);
+            color: var(--lcl-electric);
+        }
+        .model-btn.active {
+            background: linear-gradient(135deg, var(--lcl-blue), var(--lcl-accent));
+            border-color: transparent;
+            color: white;
+        }
+        .ai-status-bar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 0.75rem 0 0.5rem;
+            padding: 6px 10px;
+            background: var(--lcl-navy);
+            border-radius: 6px;
+            border: 1px solid var(--lcl-border);
+        }
+        #ai-status-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: var(--lcl-border);
+            flex-shrink: 0;
+            transition: background 0.3s, box-shadow 0.3s;
+        }
+        #ai-status-dot.listening { background: var(--lcl-green); box-shadow: 0 0 8px var(--lcl-green); }
+        #ai-status-dot.thinking  { background: var(--lcl-amber); box-shadow: 0 0 8px var(--lcl-amber); animation: pulse 0.8s infinite; }
+        #ai-status-dot.speaking  { background: var(--lcl-electric); box-shadow: 0 0 8px var(--lcl-electric); animation: pulse 0.5s infinite; }
+        #ai-status-text { font-size: 0.7rem; font-weight: 600; color: var(--lcl-muted); }
+
+        /* AI chat messages in transcript panel */
+        .seg.ai-user {
+            border-left-color: var(--lcl-amber);
+            background: rgba(245,158,11,0.06);
+        }
+        .seg.ai-assistant {
+            border-left-color: var(--lcl-accent);
+            background: rgba(99,102,241,0.07);
+        }
     </style>
 </head>
 <body>
@@ -388,13 +449,40 @@
                 <div id="bridge-status"></div>
             </div>
         </div>
+        <!-- AI Chat Mode Panel -->
+        <div class="panel">
+            <div class="panel-title">AI Chat Mode</div>
+            <div class="toggle-row">
+                <span class="toggle-label">AI Chat Active</span>
+                <label class="toggle">
+                    <input type="checkbox" id="ai-mode-toggle" onchange="toggleAiMode()">
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+            <div style="margin-top:0.75rem;">
+                <div class="vu-label">AI Model</div>
+                <div class="model-btns" id="model-btns">
+                    <button class="model-btn active" data-model="deepseek" onclick="selectModel('deepseek')">DeepSeek</button>
+                    <button class="model-btn" data-model="claude"    onclick="selectModel('claude')">Claude</button>
+                    <button class="model-btn" data-model="openai"    onclick="selectModel('openai')">GPT-4o</button>
+                    <button class="model-btn" data-model="grok"      onclick="selectModel('grok')">Grok</button>
+                    <button class="model-btn" data-model="gemini"    onclick="selectModel('gemini')">Gemini</button>
+                </div>
+            </div>
+            <div class="ai-status-bar">
+                <div id="ai-status-dot"></div>
+                <span id="ai-status-text">Idle — call +1 (321) 218-9801</span>
+            </div>
+            <button class="save-btn" style="background:linear-gradient(135deg,#7c3aed,#6d28d9);margin-top:0.4rem;" onclick="clearAiHistory()">🗑 &nbsp;Clear Conversation</button>
+            <div id="ai-clear-status" style="font-size:0.65rem;font-family:'JetBrains Mono',monospace;color:var(--lcl-muted);min-height:14px;margin-top:4px;text-align:center;"></div>
+        </div>
         </div>
 
         <!-- RIGHT: transcript -->
         <div class="panel">
             <div class="transcript-header">
                 <div class="panel-title" style="margin-bottom:0;border:none;padding:0">Live Transcript</div>
-                <span class="badge">Nova-3 · Diarization ON</span>
+                <span class="badge" id="mode-badge">Nova-3 · Diarization ON</span>
             </div>
             <div id="transcript"><div class="seg sys">Waiting for hub sync...</div></div>
         </div>
@@ -479,7 +567,13 @@
                 } else {
                     try {
                         const data = JSON.parse(e.data);
-                        if (data.type === 'transcript') {
+                        if (data.type === 'ai_mode_status') {
+                            applyAiModeStatus(data.enabled, data.model);
+                        } else if (data.type === 'ai_chat') {
+                            addAiChatMessage(data.role, data.text);
+                        } else if (data.type === 'ai_status') {
+                            setAiStatus(data.status, data.caller);
+                        } else if (data.type === 'transcript') {
                             const speaker = data.speaker || 'Speaker 1';
                             const color   = data.color   || '#00ff41';
                             const line    = `<span style="color:${color};font-weight:bold">[${speaker}]</span> ${data.text}`;
@@ -541,6 +635,78 @@
             } catch(e) { console.warn('[AUDIO] resume failed:', e); }
             console.log('[AUDIO] Context state:', audioCtx.state);
             document.getElementById('init-btn').innerText = 'AUDIO ENGINE READY (ctx=' + audioCtx.state + ')';
+        }
+
+        // ── AI Chat Mode ─────────────────────────────────
+        let currentAiModel = 'deepseek';
+
+        function toggleAiMode() {
+            const enabled = document.getElementById('ai-mode-toggle').checked;
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                document.getElementById('ai-mode-toggle').checked = !enabled;
+                return;
+            }
+            socket.send(JSON.stringify({ type: 'set_ai_mode', enabled }));
+        }
+
+        function selectModel(model) {
+            currentAiModel = model;
+            document.querySelectorAll('.model-btn').forEach(b => {
+                b.classList.toggle('active', b.dataset.model === model);
+            });
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ type: 'set_ai_model', model }));
+            }
+        }
+
+        function clearAiHistory() {
+            if (!socket || socket.readyState !== WebSocket.OPEN) return;
+            socket.send(JSON.stringify({ type: 'clear_ai_history' }));
+            const el = document.getElementById('ai-clear-status');
+            el.style.color = 'var(--lcl-green)';
+            el.innerText = '✓ History cleared';
+            setTimeout(() => { el.innerText = ''; }, 2000);
+        }
+
+        function setAiStatus(status, caller) {
+            const dot  = document.getElementById('ai-status-dot');
+            const text = document.getElementById('ai-status-text');
+            dot.className = '';
+            const labels = {
+                idle:      'Idle — call +1 (321) 218-9801',
+                listening: `Listening… (${caller || 'caller'})`,
+                thinking:  'Thinking…',
+                speaking:  'Speaking…',
+            };
+            if (status !== 'idle') {
+                dot.classList.add(status);
+            }
+            text.innerText = labels[status] || status;
+        }
+
+        function applyAiModeStatus(enabled, model) {
+            document.getElementById('ai-mode-toggle').checked = enabled;
+            const badge = document.getElementById('mode-badge');
+            if (enabled) {
+                badge.style.background   = 'rgba(99,102,241,0.2)';
+                badge.style.borderColor  = 'rgba(99,102,241,0.4)';
+                badge.style.color        = '#a5b4fc';
+                badge.innerText          = 'AI Chat · ' + model.toUpperCase();
+            } else {
+                badge.style.background  = '';
+                badge.style.borderColor = '';
+                badge.style.color       = '';
+                badge.innerText         = 'Nova-3 · Diarization ON';
+            }
+            if (model) selectModel(model);
+        }
+
+        function addAiChatMessage(role, text) {
+            const cls = role === 'user' ? 'seg ai-user' : 'seg ai-assistant';
+            const label = role === 'user' ? '📞 Caller' : '🤖 AI';
+            const color = role === 'user' ? 'var(--lcl-amber)' : 'var(--lcl-accent)';
+            const line  = `<span style="color:${color};font-weight:bold">[${label}]</span> ${text}`;
+            log(line, cls, true);
         }
 
         connect();

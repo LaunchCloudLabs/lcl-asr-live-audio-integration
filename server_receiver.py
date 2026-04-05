@@ -9,13 +9,27 @@ import base64
 import numpy as np
 import urllib.parse
 from collections import Counter
+import aiohttp
 
-# LCL Sovereign Hub V15 — "Deepgram Edition"
+# LCL Sovereign Hub V17 — "Deepgram Edition + AI Chat Mode"
 # Telnyx phone bridge + ESP32 edge streaming + Deepgram Nova-3 ASR/Diarization
 
-DEEPGRAM_API_KEY = "ea603f87124d18a21411f19c20368e27abdc696e"
-GAIN_BOOST       = 15.0
-SAMPLE_RATE      = 16000
+def _env(key, default=""):
+    """Load from env, then from ~/.lcl_keys if not set."""
+    val = os.environ.get(key, "")
+    if val:
+        return val
+    keys_file = os.path.expanduser("~/.lcl_keys")
+    if os.path.exists(keys_file):
+        for line in open(keys_file):
+            line = line.strip()
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1]
+    return default
+
+DEEPGRAM_API_KEY  = _env("DEEPGRAM_API_KEY",  "ea603f87124d18a21411f19c20368e27abdc696e")
+GAIN_BOOST        = 15.0
+SAMPLE_RATE       = 16000
 
 CERT_DIR  = os.path.expanduser("~/certbot-duckdns/config/live/launchcloud.duckdns.org")
 CERT_FILE = os.path.join(CERT_DIR, "fullchain.pem")
@@ -26,6 +40,19 @@ SPEAKER_COLORS = [
     "#ef4444", "#f97316", "#00ffcc", "#ff007f",
     "#7fff00", "#6366f1"
 ]
+
+# AI Chat Mode
+AI_SYSTEM_PROMPT = (
+    "You are a concise AI voice assistant reachable by phone. "
+    "Keep every reply under 2 sentences. Be direct and conversational. "
+    "No lists, no markdown, no formatting — speak naturally as if in a phone call."
+)
+DEEPSEEK_API_KEY  = _env("DEEPSEEK_API_KEY")
+ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY")
+OPENAI_API_KEY    = _env("OPENAI_API_KEY")
+XAI_API_KEY       = _env("XAI_API_KEY")
+GEMINI_API_KEY    = _env("GEMINI_API_KEY")
+AI_CONV_FILE      = os.path.expanduser("~/ai_conversations.json")
 
 # Shared state
 browsers      = set()
@@ -38,6 +65,11 @@ phone_pcmu_buf     = b""    # accumulator — send when >= 160 bytes (20ms at 8k
 
 # Deepgram feeder task
 audio_queue: asyncio.Queue = None   # initialized in main()
+
+# AI Chat Mode state
+ai_mode          = False
+ai_model         = "deepseek"   # deepseek | claude | openai | grok | gemini
+AI_CONVERSATIONS: dict = {}     # {caller_number: [{role, content}, ...]}
 
 # Helpers
 
@@ -60,6 +92,213 @@ def broadcast_transcript(text: str, speaker_idx: int):
     print(f"[Speaker {speaker_idx + 1}] {text.strip()}")
     if browsers:
         websockets.broadcast(browsers, msg)
+
+def broadcast_to_browsers(msg: dict):
+    if browsers:
+        websockets.broadcast(browsers, json.dumps(msg))
+
+def load_conversations():
+    global AI_CONVERSATIONS
+    try:
+        with open(AI_CONV_FILE) as f:
+            AI_CONVERSATIONS = json.load(f)
+        print(f"[AI] Loaded {len(AI_CONVERSATIONS)} conversation(s)")
+    except Exception:
+        AI_CONVERSATIONS = {}
+
+def save_conversations():
+    try:
+        with open(AI_CONV_FILE, "w") as f:
+            json.dump(AI_CONVERSATIONS, f, indent=2)
+    except Exception as e:
+        print(f"[AI] Conv save error: {e}")
+
+async def tts_to_pcmu(text: str) -> bytes:
+    """Deepgram Aura TTS → raw PCMU 8kHz bytes for Telnyx."""
+    url = (
+        "https://api.deepgram.com/v1/speak"
+        "?model=aura-asteria-en&encoding=linear16&sample_rate=8000&container=none"
+    )
+    headers = {
+        "Authorization": f"Token {DEEPGRAM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json={"text": text}, headers=headers) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    print(f"[TTS ERR] {resp.status}: {body[:200]}")
+                    return b""
+                pcm_data = await resp.read()
+        return audioop.lin2ulaw(pcm_data, 2)
+    except Exception as e:
+        print(f"[TTS ERR] {e}")
+        return b""
+
+async def send_tts_to_caller(websocket, text: str):
+    """Synthesize text and stream PCMU chunks to Telnyx caller."""
+    pcmu = await tts_to_pcmu(text)
+    if not pcmu:
+        return
+    SILENCE = b"\x7f" * 160   # PCMU silence value
+    for i in range(0, len(pcmu), 160):
+        chunk = pcmu[i:i + 160]
+        if len(chunk) < 160:
+            chunk = chunk + SILENCE[: 160 - len(chunk)]
+        payload = base64.b64encode(chunk).decode()
+        try:
+            await websocket.send(json.dumps({"event": "media", "media": {"payload": payload}}))
+        except Exception as e:
+            print(f"[TTS SEND ERR] {e}")
+            break
+
+async def get_ai_response(caller_number: str, user_text: str) -> str:
+    """Get AI response and maintain per-caller conversation history."""
+    global ai_model
+    history = AI_CONVERSATIONS.setdefault(caller_number, [])
+    history.append({"role": "user", "content": user_text})
+    if len(history) > 20:
+        history[:] = history[-20:]
+    messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}] + history
+    reply = ""
+    try:
+        if ai_model == "deepseek":
+            from openai import AsyncOpenAI
+            c = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+            r = await c.chat.completions.create(model="deepseek-chat", messages=messages, max_tokens=150)
+            reply = r.choices[0].message.content.strip()
+        elif ai_model == "claude":
+            import anthropic
+            c = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+            r = await c.messages.create(
+                model="claude-haiku-4-5", max_tokens=150,
+                system=AI_SYSTEM_PROMPT, messages=history,
+            )
+            reply = r.content[0].text.strip()
+        elif ai_model == "openai":
+            from openai import AsyncOpenAI
+            c = AsyncOpenAI(api_key=OPENAI_API_KEY)
+            r = await c.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=150)
+            reply = r.choices[0].message.content.strip()
+        elif ai_model == "grok":
+            from openai import AsyncOpenAI
+            c = AsyncOpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
+            r = await c.chat.completions.create(model="grok-3-mini", messages=messages, max_tokens=150)
+            reply = r.choices[0].message.content.strip()
+        elif ai_model == "gemini":
+            contents = []
+            for m in history[:-1]:
+                role = "user" if m["role"] == "user" else "model"
+                contents.append({"role": role, "parts": [{"text": m["content"]}]})
+            contents.append({"role": "user", "parts": [{"text": user_text}]})
+            payload = {
+                "system_instruction": {"parts": [{"text": AI_SYSTEM_PROMPT}]},
+                "contents": contents,
+                "generationConfig": {"maxOutputTokens": 150},
+            }
+            gurl = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+            async with aiohttp.ClientSession() as session:
+                async with session.post(gurl, json=payload) as resp:
+                    data = await resp.json()
+                    reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        print(f"[AI ERR] {e}")
+        reply = "Sorry, I had trouble with that. Please try again."
+    if reply:
+        history.append({"role": "assistant", "content": reply})
+        save_conversations()
+    return reply
+
+DG_CALLER_URL_BASE = (
+    "wss://api.deepgram.com/v1/listen?"
+    + urllib.parse.urlencode({
+        "model":            "nova-3",
+        "encoding":         "mulaw",
+        "sample_rate":      8000,
+        "channels":         1,
+        "punctuate":        "true",
+        "smart_format":     "true",
+        "interim_results":  "true",
+        "utterance_end_ms": 1200,
+        "vad_events":       "true",
+    })
+)
+
+async def ai_conversation_loop(websocket, stream_id: str, caller_number: str):
+    """AI voice chat: caller audio → Deepgram → AI → TTS → caller."""
+    print(f"[AI] Chat session: caller={caller_number} stream={stream_id}")
+    broadcast_to_browsers({"type": "ai_status", "status": "speaking", "caller": caller_number or "unknown"})
+
+    greeting = "Hello! I'm your AI assistant. How can I help you today?"
+    await send_tts_to_caller(websocket, greeting)
+    broadcast_to_browsers({"type": "ai_chat", "role": "assistant", "text": greeting})
+    broadcast_to_browsers({"type": "ai_status", "status": "listening"})
+
+    try:
+        async with websockets.connect(DG_CALLER_URL_BASE, additional_headers=DG_HEADERS) as dg:
+            utterance_q: asyncio.Queue = asyncio.Queue()
+
+            async def feed_audio():
+                async for msg in websocket:
+                    try:
+                        data = json.loads(msg)
+                        evt  = data.get("event", "")
+                        if evt == "media":
+                            media   = data.get("media", {})
+                            payload = (media.get("payload", "") if isinstance(media, dict) else media)
+                            if payload:
+                                await dg.send(base64.b64decode(payload))
+                        elif evt == "stop":
+                            break
+                    except Exception:
+                        pass
+                try:
+                    await dg.send(json.dumps({"type": "CloseStream"}))
+                except Exception:
+                    pass
+                await utterance_q.put(None)
+
+            async def recv_transcripts():
+                async for raw in dg:
+                    try:
+                        data = json.loads(raw)
+                        if data.get("type") != "Results":
+                            continue
+                        if not data.get("is_final", False):
+                            continue
+                        text = (data.get("channel", {})
+                                    .get("alternatives", [{}])[0]
+                                    .get("transcript", "").strip())
+                        if text:
+                            await utterance_q.put(text)
+                    except Exception:
+                        pass
+
+            feed_task = asyncio.create_task(feed_audio())
+            recv_task = asyncio.create_task(recv_transcripts())
+
+            while True:
+                utterance = await utterance_q.get()
+                if utterance is None:
+                    break
+                print(f"[AI] Caller: {utterance}")
+                broadcast_to_browsers({"type": "ai_chat",   "role": "user",     "text": utterance})
+                broadcast_to_browsers({"type": "ai_status", "status": "thinking"})
+                response = await get_ai_response(caller_number or "unknown", utterance)
+                print(f"[AI] Response: {response}")
+                broadcast_to_browsers({"type": "ai_chat",   "role": "assistant", "text": response})
+                broadcast_to_browsers({"type": "ai_status", "status": "speaking"})
+                await send_tts_to_caller(websocket, response)
+                broadcast_to_browsers({"type": "ai_status", "status": "listening"})
+
+            feed_task.cancel()
+            recv_task.cancel()
+    except Exception as e:
+        print(f"[AI ERR] {e}")
+    finally:
+        broadcast_to_browsers({"type": "ai_status", "status": "idle"})
+        print(f"[AI] Session ended: caller={caller_number}")
 
 # Deepgram streaming engine (raw WebSocket — bypasses SDK for websockets v15 compat)
 
@@ -156,21 +395,24 @@ async def deepgram_engine():
 
 # Telnyx phone bridge
 
-async def telnyx_bridge_handler(websocket, stream_id):
-    """Dedicated handler for Telnyx phone stream."""
-    print(f"[PHONE] Bridge Active for Stream: {stream_id}")
-    phone_streams.add((websocket, stream_id))
-    try:
-        async for msg in websocket:
-            pass  # inbound phone  placeholder for future bidirectionalaudio 
-    finally:
-        phone_streams.discard((websocket, stream_id))
-        print(f"[PHONE] Bridge Closed: {stream_id}")
+async def telnyx_bridge_handler(websocket, stream_id: str, caller_number: str = "unknown"):
+    """Route Telnyx call: passthrough mode or AI chat mode."""
+    if not ai_mode:
+        print(f"[PHONE] Bridge Active (PASSTHROUGH) Stream: {stream_id}")
+        phone_streams.add((websocket, stream_id))
+        try:
+            async for msg in websocket:
+                pass
+        finally:
+            phone_streams.discard((websocket, stream_id))
+            print(f"[PHONE] Bridge Closed: {stream_id}")
+    else:
+        await ai_conversation_loop(websocket, stream_id, caller_number)
 
 # ── Main WebSocket handler ─────────────────────────────────────────────────────
 
 async def handler(websocket):
-    global audio_queue
+    global audio_queue, ai_mode, ai_model
     addr = websocket.remote_address
     pkt_count = 0
 
@@ -192,14 +434,14 @@ async def handler(websocket):
                     print(f"[PHONE] Protocol connected: {data.get('version','?')}")
                     continue
                 if evt == "start":
-                    # Telnyx may use stream_id or stream_sid — try both
                     start_block = data.get("start", data)
                     sid = (start_block.get("stream_id")
                            or start_block.get("stream_sid")
                            or data.get("stream_id")
                            or "telnyx-stream")
-                    print(f"[PHONE] Stream start: sid={sid} block={start_block}")
-                    await telnyx_bridge_handler(websocket, sid)
+                    caller_number = start_block.get("from") or data.get("from") or "unknown"
+                    print(f"[PHONE] Stream start: sid={sid} from={caller_number} block={start_block}")
+                    await telnyx_bridge_handler(websocket, sid, caller_number=caller_number)
                     break
             except Exception as e:
                 print(f"[PHONE ERR] {e} | raw={message[:200]}")
@@ -215,6 +457,10 @@ async def handler(websocket):
                 if d.get("type") == "register_web":
                     print(f"[HUB] Browser verified ({addr})")
                     browsers.add(websocket)
+                    # Send current AI mode status on connect
+                    await websocket.send(json.dumps({
+                        "type": "ai_mode_status", "enabled": ai_mode, "model": ai_model
+                    }))
                 elif d.get("type") == "esp32_hello":
                     print(f"[HUB] Edge node verified ({addr})")
                     edge_nodes.add(websocket)
@@ -274,6 +520,22 @@ async def handler(websocket):
                         edge_nodes.add(websocket)
                     elif d.get("type") == "command" and edge_nodes:
                         websockets.broadcast(edge_nodes, msg)
+                    elif d.get("type") == "set_ai_mode":
+                        ai_mode = bool(d.get("enabled", False))
+                        print(f"[AI] Mode set: {'ON' if ai_mode else 'OFF'}")
+                        broadcast_to_browsers({"type": "ai_mode_status", "enabled": ai_mode, "model": ai_model})
+                    elif d.get("type") == "set_ai_model":
+                        ai_model = d.get("model", "deepseek")
+                        print(f"[AI] Model set: {ai_model}")
+                        broadcast_to_browsers({"type": "ai_mode_status", "enabled": ai_mode, "model": ai_model})
+                    elif d.get("type") == "clear_ai_history":
+                        caller = d.get("caller")
+                        if caller and caller in AI_CONVERSATIONS:
+                            del AI_CONVERSATIONS[caller]
+                        else:
+                            AI_CONVERSATIONS.clear()
+                        save_conversations()
+                        await websocket.send(json.dumps({"type": "config_status", "ok": True}))
                     elif d.get("type") == "update_config":
                         new_conf = d.get("config", {})
                         config_path = "/Users/garycolonna/lcl-asr-live-audio/bridge_config.json"
@@ -300,7 +562,8 @@ async def handler(websocket):
 async def main():
     global audio_queue
     audio_queue = asyncio.Queue(maxsize=500)  # ~500 ESP32 packets buffer
-    print("--- LCL SOVEREIGN HUB V16 (DEEPGRAM NOVA-3) ONLINE ---")
+    load_conversations()
+    print("--- LCL SOVEREIGN HUB V17 (DEEPGRAM NOVA-3 + AI CHAT MODE) ONLINE ---")
     asyncio.create_task(deepgram_engine())
 
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
